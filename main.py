@@ -18,7 +18,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,6 +50,18 @@ def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
+
+def get_gps_coordinates(image_bytes: bytes):
+    tags = exifread.process_file(io.BytesIO(image_bytes))
+    if 'GPS GPSLatitude' in tags and 'GPS GPSLongitude' in tags:
+        lat = [float(x.num) / float(x.den) for x in tags['GPS GPSLatitude'].values]
+        lon = [float(x.num) / float(x.den) for x in tags['GPS GPSLongitude'].values]
+        lat_dec = lat[0] + lat[1]/60 + lat[2]/3600
+        lon_dec = lon[0] + lon[1]/60 + lon[2]/3600
+        if tags['GPS GPSLatitudeRef'].values[0] != 'N': lat_dec = -lat_dec
+        if tags['GPS GPSLongitudeRef'].values[0] != 'E': lon_dec = -lon_dec
+        return lat_dec, lon_dec
+    return None, None
 
 @app.post("/trigger-broadcast")
 async def trigger_broadcast(
@@ -111,4 +123,36 @@ async def trigger_broadcast(
         "status": "success",
         "broadcast_alert": alert_record,
         "users_in_radius": notified_users
+    }
+
+@app.post("/predict")
+async def predict_weather(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    lat, lon = get_gps_coordinates(image_bytes)
+    if not lat or not lon:
+        return {"error": "No GPS metadata found in file EXIF."}
+
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    input_tensor = preprocess(img).unsqueeze(0)
+
+    with torch.no_grad():
+        output = model(input_tensor)
+        confidence = torch.nn.functional.softmax(output[0], dim=0)
+        top_prob, _ = torch.topk(confidence, 1)
+
+    severity = "severe" if top_prob.item() < 0.5 else "moderate"
+
+    alert_data = {
+        "title": "Satellite/Image Weather Anomaly",
+        "description": f"AI identified a {severity} formation via image analysis.",
+        "severity": severity,
+        "latitude": lat,
+        "longitude": lon
+    }
+    supabase.table("alerts").insert(alert_data).execute()
+
+    return {
+        "status": "success",
+        "extracted_location": {"lat": lat, "lon": lon},
+        "severity_prediction": severity
     }
